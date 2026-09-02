@@ -1,0 +1,39 @@
+{
+  "summary": "Tested Floor-Plan → 3D app end-to-end. Backend: 16/16 pytest tests pass (/api/, /api/floorplan/analyze, /api/floorplan/{id}, /api/floorplans, validation & persistence). Analysis of /tmp/sample.png returns walls=7, rooms=4, doors=1, windows=0 with all 8 debug stages as data URIs and OCR-matched names (Living, Bed Room, Kitchen, Room 4) — the old 160-walls/0-rooms regression is fixed. Frontend: upload → analysis → Detection Stats (7/4/1/0) works, 3D scene renders room tiles/walls/door, all 6 camera presets work, Debug tab shows 8 pipeline images with valid data-URI srcs, Rooms table shows 4 rows with focus buttons, Materials tab renders controls, isolate/show-all works. ONE blocking defect: the first time the user leaves the 3D View tab, an uncaught TypeError ('Cannot read properties of null (reading addEventListener)') is thrown from @react-three/fiber Canvas onCreated → events.connect(null), which raises the CRA dev-server 'Uncaught runtime errors' overlay that intercepts all pointer events and freezes the whole UI until dismissed.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/floorplan/analyze", "issue": "OCR misses the smaller 'DINING' label (0.8 font scale) → room falls back to generic name 'Room 4' (confidence 0.4). Expected 4/4 named rooms."},
+      {"endpoint": "POST /api/floorplan/analyze", "issue": "px_per_m falls back to 66.67 with confidence 0.2 ('fallback estimate') even though the plan contains dimension text; all rooms report dim_certain=false / 'bbox estimate'. Scale calibration from OCR dimension strings appears not to trigger."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "ThreeViewer / Tabs (FloorPlanApp.jsx)", "issue": "Switching away from the 3D View tab unmounts the R3F <Canvas> while its root render is still pending; onCreated calls events.connect(divRef.current=null) → uncaught TypeError 'Cannot read properties of null (reading addEventListener)'. In dev this shows the webpack 'Uncaught runtime errors' overlay (<iframe id=webpack-dev-server-client-overlay>) which intercepts pointer events, so tab-rooms/tab-materials/tab-3d and all room focus buttons become unclickable (Playwright: 'iframe intercepts pointer events'). Known upstream bug pmndrs/react-three-fiber#3754. Fix options: render TabsContent with forceMount + CSS hide so the Canvas never unmounts, or gate the Canvas on the active tab value with a stable eventSource, or patch/upgrade fiber to a version with the null guard in connect().", "selector": "[data-testid=\"tab-rooms\"], [data-testid=\"three-viewer\"]", "priority": "HIGH"},
+      {"component": "MaterialControls", "issue": "'Wall height'/'Wall thickness' slider tracks are invisible (only the round thumb renders, no rail) and the 'Show furniture' switch is almost invisible against the card background — very low contrast.", "selector": "[role=\"slider\"]", "priority": "MEDIUM"}
+    ],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "3D View (iso/reset preset)", "issues": ["Door plate renders as a free-standing panel protruding into the small room instead of sitting flush in the wall plane", "Room labels are rendered very small (distanceFactor 12) and nearly unreadable at default zoom"]},
+      {"screen": "Materials tab", "issues": ["Slider rails and switch have insufficient contrast / appear missing"]}
+    ]
+  },
+  "test_report_links": ["/app/backend/tests/backend_test.py", "/app/test_reports/pytest/pytest_results.xml"],
+  "action_items": [
+    "Fix the R3F Canvas unmount crash on tab switch (keep Canvas mounted via Radix forceMount + hidden CSS, or guard events.connect) — currently blocks the entire UI with the dev error overlay after the first tab switch",
+    "Make MaterialControls slider track and switch visible (contrast)",
+    "Improve OCR so small labels like 'DINING' are captured; wire dimension-string OCR into px_per_m calibration so rooms report dim_certain=true"
+  ],
+  "critical_code_review_comments": [
+    "ThreeViewer.jsx: <Html ... portal={{ current: null }}> plus mounting/unmounting the Canvas with Radix Tabs is fragile; pass a persistent eventSource/portal element or keep the viewer mounted.",
+    "ThreeViewer.jsx lines 251-257: dead `if (isolated && selectedRoomId) { }` block with empty body — remove or implement wall filtering.",
+    "server.py: analyze_floorplan returns full debug data URIs (~300KB per response) inline; consider a separate /api/floorplan/{id}/debug endpoint to keep the analyze payload small."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100%", "frontend": "85%"},
+  "seed_data_creation": "Analyzed /tmp/sample.png repeatedly; several floorplan docs inserted into MongoDB collection 'floorplans' by tests (not cleaned up — no delete endpoint exists).",
+  "should_call_test_agent_after_fix": true,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Backend pytest suite at /app/backend/tests/backend_test.py (16 tests, all green, ~3s). Frontend flow verified via Playwright with set_input_files on [data-testid=upload-file-input] and /tmp/sample.png (analysis returns in <5s). The R3F crash fires on the FIRST tab switch away from 3D View; to test the rest of the UI you must remove the overlay iframe (document.getElementById('webpack-dev-server-client-overlay').remove()) — after doing so all tabs, room focus, isolate/show-all and camera presets behaved correctly, and only 1 pageerror occurred in the whole session.",
+  "rca_of_the_issue": "@react-three/fiber 9.7.0 CanvasImpl calls state.events.connect(divRef.current) inside onCreated. When Radix Tabs unmounts the 3D TabsContent, divRef.current is already null while the reconciler root render is still pending, and createPointerEvents.connect dereferences target.addEventListener without a null guard → uncaught TypeError. CRA's dev overlay iframe then covers the viewport and swallows every click, making the app appear frozen (production build would not show the overlay but the error still throws)."
+}

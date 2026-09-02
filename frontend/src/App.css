@@ -1,0 +1,64 @@
+:root {
+  --bg: #f5f1ea;              /* warm off-white */
+  --panel: #ffffff;
+  --ink: #1c1917;
+  --muted: #78716c;
+  --accent: #b45309;          /* burnt amber */
+  --accent-2: #0f766e;        /* teal */
+  --line: #e7e2d8;
+  --wall: #e9e1d1;
+  --floor: #ddd0b6;
+  --door: #a97142;
+  --window: #7fb1c9;
+  --primary: 24 74% 33%;      /* HSL for slider/switch track (amber) */
+  --primary-foreground: 0 0% 100%;
+  --background: 40 40% 96%;
+  --ring: 24 74% 33%;
+}
+
+body, .App {
+  font-family: "IBM Plex Sans", "Fira Sans", ui-sans-serif, system-ui, sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+}
+
+.mono { font-family: "IBM Plex Mono", ui-monospace, monospace; }
+
+.grain::before {
+  content: "";
+  position: fixed; inset: 0; pointer-events: none; z-index: 1;
+  background-image: radial-gradient(rgba(0,0,0,0.035) 1px, transparent 1px);
+  background-size: 3px 3px; mix-blend-mode: multiply;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+
+.pill-btn {
+  border-radius: 9999px;
+  padding: 0.55rem 1.1rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  transition: transform 120ms ease, background-color 160ms ease, box-shadow 160ms ease;
+}
+.pill-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,0,0,.08); }
+
+.rule { border-top: 1px dashed var(--line); }
+
+.canvas-wrap {
+  height: calc(100vh - 220px);
+  min-height: 420px;
+  border-radius: 14px;
+  overflow: hidden;
+  background: linear-gradient(180deg, #efe8dc 0%, #dccfb6 100%);
+  border: 1px solid var(--line);
+}
+
+.stat {
+  font-variant-numeric: tabular-nums;
+}
+
+.selected-outline { outline: 3px solid var(--accent); }
