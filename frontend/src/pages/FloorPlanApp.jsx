@@ -8,6 +8,7 @@ import ThreeViewer from "@/components/floorplan/ThreeViewer";
 import DebugView from "@/components/floorplan/DebugView";
 import RoomInfoPanel from "@/components/floorplan/RoomInfoPanel";
 import MaterialControls from "@/components/floorplan/MaterialControls";
+import CalibrationPanel from "@/components/floorplan/CalibrationPanel";
 import { TABS } from "@/constants/testIds";
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
@@ -29,6 +30,39 @@ export default function FloorPlanApp() {
   const [selectedRoomId, setSelectedRoomId] = useState(null);
   const [isolated, setIsolated] = useState(false);
   const [cameraPreset, setCameraPreset] = useState("iso");
+
+  const applyManualScale = useCallback(({ pxPerM }) => {
+    setPlan((cur) => {
+      if (!cur) return cur;
+      const oldPxPerM = cur.analysis.px_per_m;
+      const ratio = oldPxPerM / pxPerM;
+      // rescale distance-derived quantities
+      const rescaledRooms = cur.analysis.rooms.map((r) => ({
+        ...r,
+        length_m: r.length_m * ratio,
+        width_m: r.width_m * ratio,
+        area_m2: r.area_m2 * ratio * ratio,
+        polygon: r.polygon.map((p) => [p[0] * ratio, p[1] * ratio]),
+      }));
+      const rescaledDoors = cur.analysis.doors.map((d) => ({
+        ...d, x: d.x * ratio, y: d.y * ratio, width_m: d.width_m * ratio,
+      }));
+      const rescaledWindows = cur.analysis.windows.map((w) => ({
+        ...w, x: w.x * ratio, y: w.y * ratio, width_m: w.width_m * ratio,
+      }));
+      return {
+        ...cur,
+        analysis: {
+          ...cur.analysis,
+          px_per_m: pxPerM,
+          px_per_m_confidence: 1.0,
+          rooms: rescaledRooms,
+          doors: rescaledDoors,
+          windows: rescaledWindows,
+        },
+      };
+    });
+  }, []);
 
   const onUpload = useCallback(async (file) => {
     if (!file) return;
@@ -62,6 +96,7 @@ export default function FloorPlanApp() {
       rooms: a.rooms.length,
       doors: a.doors.length,
       windows: a.windows.length,
+      stairs: (a.stairs || []).length,
       pxPerM: a.px_per_m,
       pxPerMConf: a.px_per_m_confidence,
     };
@@ -94,6 +129,9 @@ export default function FloorPlanApp() {
         <aside className="space-y-5">
           <UploadPanel loading={loading} onUpload={onUpload} />
           <DetectionStats stats={stats} />
+          {plan && (
+            <CalibrationPanel plan={plan} onCalibrate={applyManualScale} />
+          )}
           <RoomInfoPanel
             room={selectedRoom}
             plan={plan}
@@ -225,31 +263,45 @@ function RoomsTable({ plan, onSelect }) {
           </tr>
         </thead>
         <tbody>
-          {rooms.map((r) => (
-            <tr key={r.id} className="border-t border-[color:var(--line)]">
-              <td className="p-3 font-medium">{r.name}</td>
-              <td className="p-3 stat mono">{r.length_m.toFixed(2)} × {r.width_m.toFixed(2)}</td>
-              <td className="p-3 stat mono">{r.area_m2.toFixed(2)}</td>
-              <td className="p-3">
-                {r.dim_certain ? (
-                  <span className="text-[color:var(--accent-2)]">from label</span>
-                ) : (
-                  <span className="text-[color:var(--muted)]">bbox estimate</span>
-                )}
-              </td>
-              <td className="p-3 stat mono">{Math.round(r.confidence * 100)}%</td>
-              <td className="p-3">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  data-testid={`select-room-${r.id}`}
-                  onClick={() => onSelect(r.id)}
-                >
-                  focus
-                </Button>
-              </td>
-            </tr>
-          ))}
+          {rooms.map((r) => {
+            const scaleCertain = plan.analysis?.px_per_m_confidence >= 0.7;
+            const showDims = r.dim_certain || scaleCertain;
+            return (
+              <tr key={r.id} className="border-t border-[color:var(--line)]">
+                <td className="p-3 font-medium">{r.name}</td>
+                <td className="p-3 stat mono">
+                  {showDims
+                    ? `${r.length_m.toFixed(2)} × ${r.width_m.toFixed(2)}`
+                    : <span className="text-[color:var(--muted)]">unavailable</span>}
+                </td>
+                <td className="p-3 stat mono">
+                  {showDims
+                    ? r.area_m2.toFixed(2)
+                    : <span className="text-[color:var(--muted)]">unavailable</span>}
+                </td>
+                <td className="p-3">
+                  {r.dim_certain ? (
+                    <span className="text-[color:var(--accent-2)]">from label</span>
+                  ) : scaleCertain ? (
+                    <span className="text-[color:var(--muted)]">bbox estimate</span>
+                  ) : (
+                    <span className="text-[color:var(--muted)]">calibrate scale</span>
+                  )}
+                </td>
+                <td className="p-3 stat mono">{Math.round(r.confidence * 100)}%</td>
+                <td className="p-3">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    data-testid={`select-room-${r.id}`}
+                    onClick={() => onSelect(r.id)}
+                  >
+                    focus
+                  </Button>
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>

@@ -86,6 +86,30 @@ class TestAnalyze:
         assert len(a["doors"]) >= 0
         assert len(a["windows"]) >= 0
 
+    def test_walls_in_review_range(self, analysis):
+        nw = len(analysis["analysis"]["walls"])
+        assert 3 <= nw <= 20, f"walls={nw} outside 3..20"
+
+    def test_rooms_at_least_two(self, analysis):
+        assert len(analysis["analysis"]["rooms"]) >= 2
+
+    def test_door_detected(self, analysis):
+        assert len(analysis["analysis"]["doors"]) >= 1, "door arc not detected"
+
+    def test_openings_snapped_to_walls(self, analysis):
+        a = analysis["analysis"]
+        wall_ids = {w.get("id") for w in a["walls"]}
+        for kind in ("doors", "windows"):
+            for o in a[kind]:
+                assert o.get("wall_id") is not None, f"{kind} missing wall_id: {o}"
+                assert o["wall_id"] in wall_ids, f"{kind} wall_id not in walls: {o}"
+                t = o.get("wall_t")
+                assert isinstance(t, (int, float)), f"{kind} wall_t not numeric: {o}"
+                assert 0.0 <= float(t) <= 1.0, f"{kind} wall_t out of [0,1]: {t}"
+
+    def test_stairs_key_present(self, analysis):
+        assert isinstance(analysis["analysis"].get("stairs", []), list)
+
     def test_wall_geometry(self, analysis):
         for w in analysis["analysis"]["walls"]:
             for key in ["x1", "y1", "x2", "y2", "thickness_m"]:

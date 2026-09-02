@@ -40,19 +40,134 @@ function useSceneData(plan, materials) {
     // doors, labels) share this frame.
     const T = ([x, y]) => [x - cx, y - cy];
 
-    const walls = a.walls.map((w) => {
+    // Group openings by wall_id and compute their parametric span along the
+    // wall so we can render each wall as several sub-segments with gaps
+    // (real openings) plus lintels/sills over the openings.
+    const openingsByWall = new Map();
+    const pushOpening = (op, kind) => {
+      if (!op.wall_id) return;
+      const arr = openingsByWall.get(op.wall_id) || [];
+      arr.push({ ...op, kind });
+      openingsByWall.set(op.wall_id, arr);
+    };
+    a.doors.forEach((d) => pushOpening(d, "door"));
+    a.windows.forEach((w) => pushOpening(w, "window"));
+
+    const wallH = materials.wallHeight;
+    const doorH = 2.1;
+    const winH = 1.2;
+    const sillH = 0.9;
+
+    const walls = [];
+    a.walls.forEach((w) => {
       const [ax, az] = T([w.x1 / a.px_per_m, w.y1 / a.px_per_m]);
       const [bx, bz] = T([w.x2 / a.px_per_m, w.y2 / a.px_per_m]);
       const dx = bx - ax, dz = bz - az;
-      const len = Math.hypot(dx, dz);
+      const totalLen = Math.hypot(dx, dz);
       const angle = Math.atan2(dz, dx);
-      return {
-        id: w.id,
-        cx: (ax + bx) / 2, cz: (az + bz) / 2,
-        length: len, angle,
-        thickness: materials.wallThickness,
-        height: materials.wallHeight,
-      };
+      if (totalLen < 0.05) return;
+
+      // build gaps list (each with start & end t in [0..1] on this wall)
+      const gaps = (openingsByWall.get(w.id) || [])
+        .map((op) => {
+          const wPart = Math.min(op.width_m || 0.9, totalLen * 0.9);
+          const t = typeof op.wall_t === "number"
+            ? op.wall_t
+            : 0.5;
+          const halfT = wPart / (2 * totalLen);
+          return {
+            t0: Math.max(0.02, t - halfT),
+            t1: Math.min(0.98, t + halfT),
+            kind: op.kind,
+            width: wPart,
+          };
+        })
+        .filter((g) => g.t1 > g.t0)
+        .sort((a, b) => a.t0 - b.t0);
+
+      // split into solid sub-segments in world space
+      const points = [{ t: 0 }];
+      gaps.forEach((g) => {
+        points.push({ t: g.t0, gap: "start", g });
+        points.push({ t: g.t1, gap: "end", g });
+      });
+      points.push({ t: 1 });
+
+      let cursor = 0;
+      for (let i = 0; i < points.length; i += 1) {
+        if (points[i].gap === "start" || points[i].t === 1) {
+          const t0 = cursor;
+          const t1 = points[i].t;
+          if (t1 - t0 > 0.005) {
+            const segLen = (t1 - t0) * totalLen;
+            const midT = (t0 + t1) / 2;
+            walls.push({
+              id: `${w.id}_${i}`,
+              cx: ax + midT * dx,
+              cz: az + midT * dz,
+              length: segLen,
+              angle,
+              thickness: materials.wallThickness,
+              height: wallH,
+              y: wallH / 2,
+              kind: "full",
+            });
+          }
+        }
+        if (points[i].gap === "end") {
+          cursor = points[i].t;
+        }
+      }
+      // headers / lintels above openings + sill below windows
+      gaps.forEach((g) => {
+        const midT = (g.t0 + g.t1) / 2;
+        const gapLen = (g.t1 - g.t0) * totalLen;
+        if (gapLen < 0.05) return;
+        const cxg = ax + midT * dx;
+        const czg = az + midT * dz;
+        if (g.kind === "door") {
+          const headerH = wallH - doorH;
+          if (headerH > 0.05) {
+            walls.push({
+              id: `${w.id}_hdr_${midT.toFixed(3)}`,
+              cx: cxg, cz: czg,
+              length: gapLen,
+              angle,
+              thickness: materials.wallThickness,
+              height: headerH,
+              y: doorH + headerH / 2,
+              kind: "lintel",
+            });
+          }
+        } else {
+          // window: sill + top lintel
+          const topH = wallH - (sillH + winH);
+          if (sillH > 0.05) {
+            walls.push({
+              id: `${w.id}_sill_${midT.toFixed(3)}`,
+              cx: cxg, cz: czg,
+              length: gapLen,
+              angle,
+              thickness: materials.wallThickness,
+              height: sillH,
+              y: sillH / 2,
+              kind: "sill",
+            });
+          }
+          if (topH > 0.05) {
+            walls.push({
+              id: `${w.id}_top_${midT.toFixed(3)}`,
+              cx: cxg, cz: czg,
+              length: gapLen,
+              angle,
+              thickness: materials.wallThickness,
+              height: topH,
+              y: sillH + winH + topH / 2,
+              kind: "top",
+            });
+          }
+        }
+      });
     });
 
     const rooms = a.rooms.map((r) => {
@@ -79,6 +194,20 @@ function useSceneData(plan, materials) {
       const [x, z] = T([w.x, w.y]);
       return { ...w, x, z };
     });
+    const stairs = (a.stairs || []).map((st) => {
+      const pts = (st.polygon_m || []).map(T);
+      if (pts.length < 3) return null;
+      const xs = pts.map((p) => p[0]);
+      const zs = pts.map((p) => p[1]);
+      return {
+        id: st.id,
+        cx: (Math.min(...xs) + Math.max(...xs)) / 2,
+        cz: (Math.min(...zs) + Math.max(...zs)) / 2,
+        w: Math.max(...xs) - Math.min(...xs),
+        d: Math.max(...zs) - Math.min(...zs),
+        treads: st.treads,
+      };
+    }).filter(Boolean);
 
     // footprint
     const fpShape = new THREE.Shape();
@@ -89,7 +218,7 @@ function useSceneData(plan, materials) {
     fpShape.closePath();
 
     return {
-      walls, rooms, doors, windows,
+      walls, rooms, doors, windows, stairs,
       footprint: fpShape,
       extentX: maxX - minX,
       extentZ: maxY - minY,
@@ -247,54 +376,94 @@ export default function ThreeViewer({
             );
           })}
 
-          {/* walls */}
+          {/* walls (split at door/window openings; lintels/sills added) */}
           {scene.walls.map((w) => (
             <mesh
-                key={w.id}
-                castShadow
-                receiveShadow
-                position={[w.cx, w.height / 2, w.cz]}
-                rotation={[0, -w.angle, 0]}
-              >
-                <boxGeometry args={[w.length, w.height, w.thickness]} />
-                <meshStandardMaterial
-                  color={materials.wallColor}
-                  roughness={0.9}
-                />
-              </mesh>
-          ))}
-
-          {/* doors: brown vertical plate on wall */}
-          {scene.doors.map((d) => (
-            <mesh
-              key={d.id}
-              position={[d.x, 1.05, d.z]}
-              rotation={[0, -THREE.MathUtils.degToRad(d.orientation_deg), 0]}
-              castShadow
-            >
-              <boxGeometry args={[Math.max(0.7, d.width_m), 2.1, 0.05]} />
-              <meshStandardMaterial color={materials.doorColor} roughness={0.6} />
-            </mesh>
-          ))}
-
-          {/* windows */}
-          {scene.windows.map((w) => (
-            <mesh
               key={w.id}
-              position={[w.x, 1.5, w.z]}
-              rotation={[0, -THREE.MathUtils.degToRad(w.orientation_deg), 0]}
               castShadow
+              receiveShadow
+              position={[w.cx, w.y, w.cz]}
+              rotation={[0, -w.angle, 0]}
             >
-              <boxGeometry args={[Math.max(0.7, w.width_m), 1.2, 0.05]} />
+              <boxGeometry args={[w.length, w.height, w.thickness]} />
               <meshStandardMaterial
-                color={materials.windowColor}
-                transparent
-                opacity={0.55}
-                roughness={0.1}
-                metalness={0.1}
+                color={materials.wallColor}
+                roughness={0.9}
               />
             </mesh>
           ))}
+
+          {/* door leaves — thin plate positioned inside the opening, rotated
+              90° so it looks like an open door. Height matches door height. */}
+          {scene.doors.map((d) => (
+            <group
+              key={d.id}
+              position={[d.x, 0, d.z]}
+              rotation={[0, -THREE.MathUtils.degToRad(d.orientation_deg), 0]}
+            >
+              <mesh position={[0, 1.05, (d.width_m || 0.9) / 2 - 0.04]}
+                    castShadow rotation={[0, Math.PI / 2, 0]}>
+                <boxGeometry args={[(d.width_m || 0.9) * 0.95, 2.05, 0.04]} />
+                <meshStandardMaterial color={materials.doorColor} roughness={0.55} />
+              </mesh>
+              {/* door frame */}
+              <mesh position={[0, 1.05, 0]}>
+                <boxGeometry args={[(d.width_m || 0.9) + 0.06, 2.1, materials.wallThickness + 0.02]} />
+                <meshStandardMaterial color="#4a3324" roughness={0.7} wireframe />
+              </mesh>
+            </group>
+          ))}
+
+          {/* window glass panes inside their openings */}
+          {scene.windows.map((w) => (
+            <mesh
+              key={w.id}
+              position={[w.x, 0.9 + 1.2 / 2, w.z]}
+              rotation={[0, -THREE.MathUtils.degToRad(w.orientation_deg), 0]}
+              castShadow
+            >
+              <boxGeometry args={[Math.max(0.6, w.width_m || 0.9), 1.15, 0.04]} />
+              <meshStandardMaterial
+                color={materials.windowColor}
+                transparent
+                opacity={0.35}
+                roughness={0.05}
+                metalness={0.2}
+              />
+            </mesh>
+          ))}
+
+          {/* stairs: stack of thin plates */}
+          {scene.stairs.map((s) => {
+            const nTreads = Math.max(4, Math.min(14, s.treads || 8));
+            const treadDepth = Math.max(s.w, s.d) / nTreads;
+            const treadWidth = Math.min(s.w, s.d);
+            const horiz = s.w >= s.d;
+            return (
+              <group key={s.id} position={[s.cx, 0, s.cz]}>
+                {Array.from({ length: nTreads }).map((_, i) => {
+                  const h = 0.15 * (i + 1);
+                  const off = -Math.max(s.w, s.d) / 2 + treadDepth * (i + 0.5);
+                  return (
+                    <mesh
+                      key={i}
+                      castShadow receiveShadow
+                      position={[horiz ? off : 0, h / 2, horiz ? 0 : off]}
+                    >
+                      <boxGeometry
+                        args={
+                          horiz
+                            ? [treadDepth * 0.95, h, treadWidth]
+                            : [treadWidth, h, treadDepth * 0.95]
+                        }
+                      />
+                      <meshStandardMaterial color="#b98a5b" roughness={0.7} />
+                    </mesh>
+                  );
+                })}
+              </group>
+            );
+          })}
 
           <CameraRig preset={cameraPreset} extent={extent} controlsRef={controlsRef} />
         </Canvas>

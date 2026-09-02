@@ -93,6 +93,7 @@ class Opening:
     orientation_deg: float
     wall_id: str | None
     confidence: float
+    wall_t: float | None = None  # 0..1 position along the wall (set post-snap)
 
 
 @dataclass
@@ -177,63 +178,89 @@ class FloorPlanAnalyzer:
 
     # -------- stage 2: OCR --------
     def run_ocr(self) -> tuple[list[DimensionText], list[dict], np.ndarray]:
-        try:
-            data = pytesseract.image_to_data(
-                self.gray, output_type=pytesseract.Output.DICT, config="--psm 11"
-            )
-        except Exception:
-            data = {"text": [], "left": [], "top": [], "width": [], "height": [], "conf": []}
+        # try multiple page-segmentation modes and merge results, tesseract
+        # is finicky about small labels on architectural drawings
+        candidates: list[dict] = []
+        for cfg in ("--psm 6", "--psm 11", "--psm 12"):
+            try:
+                d = pytesseract.image_to_data(
+                    self.gray, output_type=pytesseract.Output.DICT, config=cfg
+                )
+                candidates.append(d)
+            except Exception:
+                continue
+        if not candidates:
+            candidates = [{"text": [], "left": [], "top": [], "width": [],
+                           "height": [], "conf": []}]
 
         text_mask = np.zeros((self.h, self.w), dtype=np.uint8)
         dims: list[DimensionText] = []
         labels: list[dict] = []
+        seen_texts: set[tuple[int, int, str]] = set()
 
-        n = len(data["text"])
-        # group tokens by line to combine dimension strings
-        by_line: dict[tuple, list[int]] = {}
-        for i in range(n):
-            key = (data.get("block_num", [0]*n)[i], data.get("par_num", [0]*n)[i],
-                   data.get("line_num", [0]*n)[i])
-            by_line.setdefault(key, []).append(i)
-
-        for idxs in by_line.values():
-            tokens = []
-            xs, ys, ws, hs, confs = [], [], [], [], []
-            for i in idxs:
+        for data in candidates:
+            n = len(data["text"])
+            # iterate per WORD/token — grouping into lines merges labels
+            # from different rooms and their bounding-boxes then erase walls
+            # in between. So we paint the mask token-by-token.
+            for i in range(n):
                 t = (data["text"][i] or "").strip()
                 if not t:
                     continue
-                tokens.append(t)
-                xs.append(data["left"][i])
-                ys.append(data["top"][i])
-                ws.append(data["width"][i])
-                hs.append(data["height"][i])
+                if len(t) < 2 and not t.replace("'", "").replace('"', "").isdigit():
+                    continue
+                x0 = data["left"][i]
+                y0 = data["top"][i]
+                w_ = data["width"][i]
+                h_ = data["height"][i]
+                x1_ = x0 + w_
+                y1_ = y0 + h_
+                cx_ = x0 + w_ / 2.0
+                cy_ = y0 + h_ / 2.0
                 try:
-                    confs.append(float(data["conf"][i]))
+                    conf = float(data["conf"][i])
                 except (ValueError, TypeError):
-                    confs.append(0.0)
-            if not tokens:
-                continue
-            line_text = " ".join(tokens)
-            x0 = min(xs); y0 = min(ys); x1 = max(x+w for x, w in zip(xs, ws))
-            y1 = max(y+h for y, h in zip(ys, hs))
-            cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
-            # paint text region on the mask a bit dilated
-            pad = 4
-            cv2.rectangle(text_mask, (max(x0-pad, 0), max(y0-pad, 0)),
-                          (min(x1+pad, self.w-1), min(y1+pad, self.h-1)), 255, -1)
+                    conf = 0.0
+                key = (int(cx_ // 8), int(cy_ // 8), t.lower())
+                if key in seen_texts:
+                    continue
+                seen_texts.add(key)
+                pad = 3
+                cv2.rectangle(text_mask,
+                              (max(x0 - pad, 0), max(y0 - pad, 0)),
+                              (min(x1_ + pad, self.w - 1),
+                               min(y1_ + pad, self.h - 1)),
+                              255, -1)
+                low = t.lower()
+                for kw in ROOM_KEYWORDS:
+                    if kw in low:
+                        labels.append({"text": t, "x": cx_, "y": cy_,
+                                       "keyword": kw, "conf": conf})
+                        break
 
-            ft_w, ft_h = _parse_dimension(line_text)
-            if ft_w and ft_h:
-                dims.append(DimensionText(text=line_text, x=cx, y=cy,
-                                          width_ft=ft_w, height_ft=ft_h))
-
-            low = line_text.lower()
-            for kw in ROOM_KEYWORDS:
-                if kw in low:
-                    labels.append({"text": line_text, "x": cx, "y": cy, "keyword": kw,
-                                   "conf": float(np.mean(confs)) if confs else 0.0})
-                    break
+            # also collect dimension strings by scanning grouped lines
+            by_line: dict[tuple, list[int]] = {}
+            for i in range(n):
+                key = (data.get("block_num", [0]*n)[i],
+                       data.get("par_num", [0]*n)[i],
+                       data.get("line_num", [0]*n)[i])
+                by_line.setdefault(key, []).append(i)
+            for idxs in by_line.values():
+                toks = [(data["text"][i] or "").strip() for i in idxs]
+                toks = [t for t in toks if t]
+                if not toks:
+                    continue
+                line_text = " ".join(toks)
+                ft_w, ft_h = _parse_dimension(line_text)
+                if ft_w and ft_h:
+                    xs = [data["left"][i] for i in idxs]
+                    ys = [data["top"][i] for i in idxs]
+                    dims.append(DimensionText(
+                        text=line_text,
+                        x=float(np.mean(xs)),
+                        y=float(np.mean(ys)),
+                        width_ft=ft_w, height_ft=ft_h,
+                    ))
 
         self.debug["text_mask"] = text_mask
         return dims, labels, text_mask
@@ -400,35 +427,43 @@ class FloorPlanAnalyzer:
     # -------- stage 6: doors & windows --------
     def detect_openings(self, walls: list[WallSeg]) -> tuple[list[Opening], list[Opening]]:
         # Doors: detect quarter-circle arcs via HoughCircles on cleaned image.
-        # (Furniture etc might also produce circles; we filter by radius range.)
+        # (Furniture etc might also produce circles; we filter by radius range
+        # and by proximity to a wall.)
         gray = self.gray.copy()
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
         circles = cv2.HoughCircles(
-            gray, cv2.HOUGH_GRADIENT, dp=1.2, minDist=30,
-            param1=80, param2=35,
-            minRadius=int(self.px_per_m * 0.3),
-            maxRadius=int(self.px_per_m * 1.5),
+            gray, cv2.HOUGH_GRADIENT, dp=1.5, minDist=30,
+            param1=60, param2=22,
+            minRadius=int(self.px_per_m * 0.25),
+            maxRadius=int(self.px_per_m * 1.6),
         )
         doors: list[Opening] = []
         vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         if circles is not None:
+            best_per_wall: dict[str, tuple[float, Opening]] = {}
             for i, c in enumerate(circles[0]):
                 cx, cy, r = float(c[0]), float(c[1]), float(c[2])
-                # attach to nearest wall
                 wall, dist = _nearest_wall((cx, cy), walls)
-                if wall is None or dist > r * 1.5:
+                if wall is None or dist > r * 0.6:
                     continue
                 width_m = round(2 * r / self.px_per_m, 3)
-                if width_m < 0.5 or width_m > 1.8:
+                if width_m < 0.55 or width_m > 1.8:
                     continue
-                doors.append(Opening(
+                # score by inverse distance to wall
+                score = 1.0 / (1.0 + dist)
+                op = Opening(
                     id=f"d{i}", kind="door",
                     x=cx / self.px_per_m, y=cy / self.px_per_m,
                     width_m=width_m,
                     orientation_deg=_wall_angle(wall),
-                    wall_id=wall.id, confidence=0.5,
-                ))
-                cv2.circle(vis, (int(cx), int(cy)), int(r), (0, 165, 255), 2)
+                    wall_id=wall.id, confidence=0.6,
+                )
+                key = wall.id
+                if key not in best_per_wall or score > best_per_wall[key][0]:
+                    best_per_wall[key] = (score, op)
+                cv2.circle(vis, (int(cx), int(cy)), int(r), (0, 165, 255), 1)
+            for _, op in best_per_wall.values():
+                doors.append(op)
         self.debug["doors"] = vis
 
         # Windows: gaps along walls filled with parallel thin lines - detect
@@ -436,44 +471,58 @@ class FloorPlanAnalyzer:
         # are non-solid in the wall mask but have parallel edges nearby.
         wvis = cv2.cvtColor(self.gray, cv2.COLOR_GRAY2BGR)
         windows: list[Opening] = []
-        # Heuristic placeholder: sample along wall centerlines, if wall mask
-        # has a periodic thin structure -> mark as window. This keeps us from
-        # inventing windows we can't verify. We report low confidence.
+        # We are conservative: only mark clear low-fill segments as windows
+        # and require enough continuous evidence, otherwise skip. This avoids
+        # peppering the wall with false-positive windows.
         edges = cv2.Canny(self.gray, 60, 160)
         for wi, w in enumerate(walls):
             length_px = _segment_length((w.x1, w.y1, w.x2, w.y2))
-            if length_px < self.px_per_m * 0.8:
+            if length_px < self.px_per_m * 1.2:
                 continue
-            samples = int(length_px // max(8, int(self.px_per_m * 0.3)))
+            samples = max(6, int(length_px // max(10, int(self.px_per_m * 0.4))))
+            hits: list[tuple[int, float, float]] = []
             for s in range(1, samples - 1):
                 t = s / samples
                 px = w.x1 + t * (w.x2 - w.x1)
                 py = w.y1 + t * (w.y2 - w.y1)
-                # local patch
                 r = 6
                 x0, y0 = int(max(px-r, 0)), int(max(py-r, 0))
-                x1, y1 = int(min(px+r, self.w-1)), int(min(py+r, self.h-1))
-                patch = edges[y0:y1, x0:x1]
-                if patch.size == 0:
+                x1_ = int(min(px+r, self.w-1)); y1_ = int(min(py+r, self.h-1))
+                epatch = edges[y0:y1_, x0:x1_]
+                wpatch = self.wall_bw[y0:y1_, x0:x1_]
+                if epatch.size == 0 or wpatch.size == 0:
                     continue
-                density = float(patch.mean())
-                # windows have moderate edge density (thin double lines)
-                # while solid walls have very high density in wall_bw
-                wpatch = self.wall_bw[y0:y1, x0:x1]
-                if wpatch.size == 0:
-                    continue
+                density = float(epatch.mean())
                 wfill = float(wpatch.mean()) / 255.0
-                if 25 < density < 120 and 0.15 < wfill < 0.55:
+                if 25 < density < 120 and 0.15 < wfill < 0.5:
+                    hits.append((s, px, py))
+            # coalesce consecutive hits into a single window
+            if hits:
+                groups: list[list[tuple[int, float, float]]] = []
+                cur = [hits[0]]
+                for h in hits[1:]:
+                    if h[0] - cur[-1][0] <= 2:
+                        cur.append(h)
+                    else:
+                        groups.append(cur); cur = [h]
+                groups.append(cur)
+                # keep only groups with at least 3 hits (real windows)
+                for gi, g in enumerate(groups):
+                    if len(g) < 3:
+                        continue
+                    ax = sum(p[1] for p in g) / len(g)
+                    ay = sum(p[2] for p in g) / len(g)
+                    span = _segment_length((g[0][1], g[0][2], g[-1][1], g[-1][2]))
+                    win_w_m = round(max(0.6, span / self.px_per_m), 3)
                     windows.append(Opening(
-                        id=f"win{wi}_{s}", kind="window",
-                        x=px / self.px_per_m, y=py / self.px_per_m,
-                        width_m=round(0.9, 3),
+                        id=f"win{wi}_{gi}", kind="window",
+                        x=ax / self.px_per_m, y=ay / self.px_per_m,
+                        width_m=win_w_m,
                         orientation_deg=_wall_angle(w),
-                        wall_id=w.id, confidence=0.25,
+                        wall_id=w.id, confidence=0.55,
                     ))
-                    cv2.circle(wvis, (int(px), int(py)), 6, (255, 200, 0), 2)
-        # dedupe windows that are too close (keep one per neighborhood)
-        windows = _dedupe_openings(windows, min_dist_m=1.2)
+                    cv2.circle(wvis, (int(ax), int(ay)), 8, (255, 200, 0), 2)
+        windows = _dedupe_openings(windows, min_dist_m=1.5)
         self.debug["windows"] = wvis
         return doors, windows
 
@@ -512,6 +561,96 @@ class FloorPlanAnalyzer:
             self.px_per_m = px_per_ft / 0.3048
             self.px_per_m_confidence = 0.9
 
+    # -------- stage 7.5: stairs --------
+    def detect_stairs(self) -> list[dict]:
+        """Detect stair regions from tightly-packed groups of parallel short
+        line segments (tread pattern). Very conservative to avoid false
+        positives on floor tiles or window blinds.
+        """
+        try:
+            edges = cv2.Canny(self.gray, 40, 120)
+            edges = cv2.bitwise_and(edges, cv2.bitwise_not(self.wall_bw))
+        except Exception:
+            return []
+        min_len_px = max(20, int(self.px_per_m * 0.7))
+        max_len_px = int(self.px_per_m * 1.8)     # a tread is < ~1.8m wide
+        lines = cv2.HoughLinesP(
+            edges, 1, np.pi / 180, threshold=30,
+            minLineLength=min_len_px,
+            maxLineGap=int(min_len_px * 0.2),
+        )
+        if lines is None:
+            return []
+        segs: list[tuple[float, float, float, float, float]] = []
+        for l in lines:
+            arr = l[0] if len(l) == 1 else l
+            x1, y1, x2, y2 = arr[0], arr[1], arr[2], arr[3]
+            L = math.hypot(x2 - x1, y2 - y1)
+            if L < min_len_px or L > max_len_px:
+                continue
+            a = _seg_angle((x1, y1, x2, y2))
+            segs.append((float(x1), float(y1), float(x2), float(y2), a))
+        stairs: list[dict] = []
+        used = [False] * len(segs)
+        min_tread_gap = self.px_per_m * 0.18   # 18 cm typical tread depth
+        max_tread_gap = self.px_per_m * 0.35   # 35 cm
+        for i, s in enumerate(segs):
+            if used[i]:
+                continue
+            group = [i]
+            a0 = s[4]
+            ar = math.radians(a0)
+            nx, ny = -math.sin(ar), math.cos(ar)
+            base = nx * (s[0] + s[2]) / 2 + ny * (s[1] + s[3]) / 2
+            for j in range(i + 1, len(segs)):
+                if used[j]:
+                    continue
+                if abs(((segs[j][4] - a0 + 90) % 180) - 90) > 3:
+                    continue
+                pj = nx * (segs[j][0] + segs[j][2]) / 2 + ny * (segs[j][1] + segs[j][3]) / 2
+                # only accept if perpendicular spacing matches tread size
+                offs = [nx * (segs[k][0] + segs[k][2]) / 2 + ny * (segs[k][1] + segs[k][3]) / 2
+                        for k in group]
+                nearest = min(abs(pj - o) for o in offs)
+                if min_tread_gap <= nearest <= max_tread_gap:
+                    group.append(j)
+            # need enough treads AND consistent spacing
+            if len(group) < 5:
+                continue
+            offs = sorted(nx * (segs[k][0] + segs[k][2]) / 2 + ny * (segs[k][1] + segs[k][3]) / 2
+                          for k in group)
+            gaps = [offs[k+1] - offs[k] for k in range(len(offs)-1)]
+            mean_gap = sum(gaps) / len(gaps)
+            if not (min_tread_gap <= mean_gap <= max_tread_gap):
+                continue
+            std_gap = (sum((g - mean_gap) ** 2 for g in gaps) / len(gaps)) ** 0.5
+            if std_gap / mean_gap > 0.35:     # tread spacing should be regular
+                continue
+            for k in group:
+                used[k] = True
+            xs = [segs[k][0] for k in group] + [segs[k][2] for k in group]
+            ys = [segs[k][1] for k in group] + [segs[k][3] for k in group]
+            minx, maxx = min(xs), max(xs)
+            miny, maxy = min(ys), max(ys)
+            # bounding box must be compact enough to be a stair
+            bb_area_px = (maxx - minx) * (maxy - miny)
+            plan_area_px = self.w * self.h
+            if bb_area_px > plan_area_px * 0.12:
+                continue
+            stairs.append({
+                "id": f"stair{len(stairs)}",
+                "polygon_m": [
+                    [minx / self.px_per_m, miny / self.px_per_m],
+                    [maxx / self.px_per_m, miny / self.px_per_m],
+                    [maxx / self.px_per_m, maxy / self.px_per_m],
+                    [minx / self.px_per_m, maxy / self.px_per_m],
+                ],
+                "treads": len(group),
+                "angle_deg": a0,
+                "confidence": 0.6,
+            })
+        return stairs
+
     # -------- orchestrate --------
     def run(self) -> AnalysisResult:
         self.preprocess()
@@ -521,6 +660,12 @@ class FloorPlanAnalyzer:
         walls = self.vectorize_walls()
         rooms = self.detect_rooms(labels, dims)
         doors, windows = self.detect_openings(walls)
+        stairs = self.detect_stairs()
+
+        # snap doors/windows to their wall centerlines and remember parametric
+        # position along the wall (t in [0,1]) so the frontend can cut walls.
+        doors = _snap_openings_to_walls(doors, walls, self.px_per_m)
+        windows = _snap_openings_to_walls(windows, walls, self.px_per_m)
 
         debug_b64 = {name: _png_b64(img) for name, img in self.debug.items()}
 
@@ -534,7 +679,7 @@ class FloorPlanAnalyzer:
             doors=doors,
             windows=windows,
             dimensions=dims,
-            stairs=[],
+            stairs=stairs,
             defaults={
                 "wall_height_m": DEFAULT_WALL_HEIGHT_M,
                 "door_height_m": DEFAULT_DOOR_HEIGHT_M,
@@ -668,6 +813,42 @@ def _dedupe_openings(items: list[Opening], min_dist_m: float) -> list[Opening]:
         if not collision:
             kept.append(it)
     return kept
+
+
+def _snap_openings_to_walls(items: list[Opening], walls: list[WallSeg],
+                            px_per_m: float) -> list[Opening]:
+    """Project each opening onto its owning wall centerline and record the
+    parametric position along the wall (0..1). Coordinates in meters.
+    Returns opening list with .x/.y updated to the wall centerline.
+    """
+    wall_by_id = {w.id: w for w in walls}
+    out: list[Opening] = []
+    for op in items:
+        w = wall_by_id.get(op.wall_id or "")
+        if not w:
+            out.append(op)
+            continue
+        # convert wall endpoints to meters
+        wx1, wy1 = w.x1 / px_per_m, w.y1 / px_per_m
+        wx2, wy2 = w.x2 / px_per_m, w.y2 / px_per_m
+        dx, dy = wx2 - wx1, wy2 - wy1
+        L2 = dx * dx + dy * dy
+        if L2 <= 1e-9:
+            out.append(op)
+            continue
+        t = max(0.0, min(1.0, ((op.x - wx1) * dx + (op.y - wy1) * dy) / L2))
+        nx = wx1 + t * dx
+        ny = wy1 + t * dy
+        # store t in wall_id-tagged position; overwrite x/y with snapped coords.
+        new = Opening(
+            id=op.id, kind=op.kind, x=nx, y=ny,
+            width_m=op.width_m, orientation_deg=op.orientation_deg,
+            wall_id=op.wall_id, confidence=op.confidence,
+        )
+        # attach parametric position along the wall
+        new.wall_t = float(t)
+        out.append(new)
+    return out
 
 
 # --------------------------- public API -----------------------------------
